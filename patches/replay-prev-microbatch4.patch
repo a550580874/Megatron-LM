@@ -1,0 +1,309 @@
+--- a/pretrain_gpt.py
++++ b/pretrain_gpt.py
+@@ -6,6 +6,7 @@
+ import time
+ _PROGRAM_START_TIME = time.time()
+ 
++import copy
+ import json
+ 
+ # Suppress warnings on all ranks but rank 0.
+@@ -62,22 +63,113 @@
+ 
+ stimer = StragglerDetector()
+ 
+-
+-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+-    """Generate a batch."""
+-    args = get_args()
+-    config = core_transformer_config_from_args(args)
+-    # TODO: this is pretty hacky, find a better way
+-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+-        return None, None, None, None, None, None
+-
+-    
+-    # get batches based onthe TP rank you are on
+-    batch = get_batch_on_this_tp_rank(
+-        data_iterator,
+-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
+-
++# This state lives in the GPT entrypoint because we do not want to alter the
++# scheduler: the deeper train loop should still execute the target micro-step,
++# but that micro-step should see the previous batch instead of consuming a new
++# one from the iterator.
++_MICROBATCH_REPLAY_STATE = {
++    "iteration": None,
++    "microbatch": 0,
++    "last_batch": None,
++    "logged_targets": set(),
++}
++
++_DEBUG_NORM_ITERATION = 4516
++_DEBUG_NORM_RANK = 34
++
++
++def _clone_batch_for_replay(batch):
++    """Clone a batch dict so it can be replayed without aliasing tensors."""
++    cloned_batch = {}
++    for key, value in batch.items():
++        if torch.is_tensor(value):
++            cloned_batch[key] = value.clone()
++        else:
++            cloned_batch[key] = copy.deepcopy(value)
++    return cloned_batch
++
++
++def _parse_iteration_microbatch_pairs(raw_pairs):
++    """Parse 1-based iteration:microbatch CLI selectors."""
++    parsed_pairs = set()
++    for raw_pair in raw_pairs or []:
++        try:
++            iteration_str, microbatch_str = raw_pair.split(":", maxsplit=1)
++            iteration = int(iteration_str)
++            microbatch = int(microbatch_str)
++        except ValueError as exc:
++            raise ValueError(
++                f"Invalid --replay-prev-microbatch value '{raw_pair}'. Expected ITERATION:MICROBATCH."
++            ) from exc
++        if iteration < 1 or microbatch < 1:
++            raise ValueError(
++                f"Invalid --replay-prev-microbatch value '{raw_pair}'. ITERATION and MICROBATCH must both be >= 1."
++            )
++        parsed_pairs.add((iteration, microbatch))
++    return parsed_pairs
++
++
++def _get_replay_prev_microbatch_targets(args):
++    if not hasattr(args, "replay_prev_microbatch_targets"):
++        args.replay_prev_microbatch_targets = _parse_iteration_microbatch_pairs(
++            getattr(args, "replay_prev_microbatch", [])
++        )
++    return args.replay_prev_microbatch_targets
++
++
++def _batch_l2_norm(batch):
++    total = 0.0
++    for value in batch.values():
++        if torch.is_tensor(value) and value is not None:
++            tensor = value.detach().to(dtype=torch.float64)
++            total += torch.sum(tensor * tensor).item()
++    return total ** 0.5
++
++
++def _format_batch_norm_line(label, current_iteration, current_microbatch, batch):
++    return (
++        f"[debug-batch-norm] rank={_DEBUG_NORM_RANK} iteration={current_iteration} "
++        f"microbatch={current_microbatch} label={label} l2_norm={_batch_l2_norm(batch):.6f}"
++    )
++
++
++class _SingleBatchIterator:
++    """Yield exactly one already-materialized batch."""
++
++    def __init__(self, batch):
++        self._batch = batch
++        self._consumed = False
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        if self._consumed:
++            raise StopIteration
++        self._consumed = True
++        return self._batch
++
++
++def add_gpt_debug_args(parser):
++    """Add GPT entrypoint-local debug controls."""
++    parser.add_argument(
++        "--replay-prev-microbatch",
++        action="append",
++        default=[],
++        metavar="ITERATION:MICROBATCH",
++        help=(
++            "Replay the previous microbatch instead of consuming new data at the given 1-based "
++            "training iteration and 1-based microbatch index. Can be passed multiple times."
++        ),
++    )
++
++    if has_nvidia_modelopt:
++        parser = add_modelopt_args(parser)
++    return parser
++
++
++def _prepare_batch_from_tp(batch, args):
++    """Apply the existing post-TP packed-sequence and CP slicing logic."""
+     cu_seqlens = batch.pop('cu_seqlens', None)
+     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+     max_seqlen = batch.pop('max_seqlen', None)
+@@ -85,17 +177,7 @@
+     if local_cp_size is not None:
+         local_cp_size = int(local_cp_size.item())
+ 
+-    # GPT pretraining packed/THD path: dataset emits cu_seqlens but no
+-    # cu_seqlens_padded (no per-doc padding in pretraining). Fall back to
+-    # using cu_seqlens directly so the THD slicer / flash-attn varlen kernel
+-    # treats every doc boundary as an attention-isolated segment.
+     if cu_seqlens is not None and cu_seqlens_padded is None:
+-        # The packed pretrain path requires micro-batch-size == 1 because each
+-        # sample produces a variable-length cu_seqlens tensor (one entry per
+-        # in-sample EOD); default PyTorch collate cannot stack variable-length
+-        # 1-D tensors, and the TP broadcaster in get_batch_on_this_tp_rank
+-        # also asserts cu_seqlens.shape[0] == 1. Fail fast here with a clear
+-        # message instead of crashing deep inside the broadcast / collate.
+         assert args.micro_batch_size == 1, (
+             "Packed/THD pretraining path (reset_attention_mask / "
+             "reset_position_ids) requires --micro-batch-size 1 "
+@@ -104,10 +186,6 @@
+         )
+         cu_seqlens_padded = cu_seqlens
+ 
+-        # When CP > 1, get_thd_batch_on_this_cp_rank slices each segment via
+-        # tex.thd_get_partitioned_indices, which requires every per-doc
+-        # segment length to be divisible by 2 * cp_size. Pretraining doesn't
+-        # pad doc segments (unlike SFTDataset), so detect & fail loudly.
+         cp_size = args.context_parallel_size
+         if cp_size > 1:
+             seg_lens = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1])
+@@ -127,14 +205,92 @@
+                 )
+ 
+     if cu_seqlens is None and local_cp_size is None:
+-        # slice batch along sequence dimension for context parallelism
+-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
++        batch = get_batch_on_this_cp_rank(batch)
+         packed_seq_params = None
+-    elif local_cp_size is None:  # Packed THD format
++    elif local_cp_size is None:
+         assert max_seqlen.dim() == 1
+-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+-    else: # Hybrid CP format
++        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
++            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
++        )
++    else:
+         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
++
++    return batch, packed_seq_params
++
++
++def get_batch(data_iterator, vp_stage: Optional[int] = None):
++    """Generate a batch."""
++    args = get_args()
++    config = core_transformer_config_from_args(args)
++    replay_targets = _get_replay_prev_microbatch_targets(args)
++    global _MICROBATCH_REPLAY_STATE
++    current_iteration = getattr(args, "curr_iteration", 0) + 1
++    if _MICROBATCH_REPLAY_STATE["iteration"] != current_iteration:
++        _MICROBATCH_REPLAY_STATE["iteration"] = current_iteration
++        _MICROBATCH_REPLAY_STATE["microbatch"] = 0
++        if hasattr(args, "replay_prev_microbatch_debug_lines"):
++            args.replay_prev_microbatch_debug_lines = []
++    current_microbatch = _MICROBATCH_REPLAY_STATE["microbatch"] + 1
++    _MICROBATCH_REPLAY_STATE["microbatch"] = current_microbatch
++    should_replay_previous = (current_iteration, current_microbatch) in replay_targets
++    # TODO: this is pretty hacky, find a better way
++    if not is_first_or_last_pipeline_stage(vp_stage) and (
++    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
++        return None, None, None, None, None, None
++
++    mtp_enabled = mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
++    if should_replay_previous and parallel_state.get_tensor_model_parallel_rank() == 0:
++        if _MICROBATCH_REPLAY_STATE["last_batch"] is None:
++            raise RuntimeError(
++                "Cannot replay previous microbatch before any prior batch has been cached. "
++                f"Received request for iteration {current_iteration}, microbatch {current_microbatch}."
++            )
++        # Still consume the real next batch so the iterator stays aligned and
++        # microbatch 18 does not accidentally train on microbatch 17's data.
++        original_source_batch = next(data_iterator)
++        replay_source_batch = _clone_batch_for_replay(_MICROBATCH_REPLAY_STATE["last_batch"])
++        batch = get_batch_on_this_tp_rank(
++            _SingleBatchIterator(replay_source_batch),
++            mtp_on_this_rank=mtp_enabled,
++        )
++        _MICROBATCH_REPLAY_STATE["last_batch"] = _clone_batch_for_replay(original_source_batch)
++        target_key = (current_iteration, current_microbatch)
++        if target_key not in _MICROBATCH_REPLAY_STATE["logged_targets"]:
++            print_rank_0(
++                f"> replaying previous microbatch at iteration {current_iteration}, "
++                f"microbatch {current_microbatch}"
++            )
++            _MICROBATCH_REPLAY_STATE["logged_targets"].add(target_key)
++    elif should_replay_previous:
++        batch = get_batch_on_this_tp_rank(
++            _SingleBatchIterator(None),
++            mtp_on_this_rank=mtp_enabled,
++        )
++    else:
++        batch = get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank=mtp_enabled)
++        if parallel_state.get_tensor_model_parallel_rank() == 0:
++            _MICROBATCH_REPLAY_STATE["last_batch"] = _clone_batch_for_replay(batch)
++
++    batch, packed_seq_params = _prepare_batch_from_tp(batch, args)
++
++    debug_lines = []
++    if current_iteration == _DEBUG_NORM_ITERATION and rank == _DEBUG_NORM_RANK:
++        debug_lines.append(
++            _format_batch_norm_line("used", current_iteration, current_microbatch, batch)
++        )
++
++    if (
++        current_iteration == _DEBUG_NORM_ITERATION
++        and torch.distributed.is_available()
++        and torch.distributed.is_initialized()
++        and torch.distributed.get_world_size() > _DEBUG_NORM_RANK
++    ):
++        debug_lines_holder = [debug_lines if rank == _DEBUG_NORM_RANK else None]
++        torch.distributed.broadcast_object_list(debug_lines_holder, src=_DEBUG_NORM_RANK)
++        debug_lines = debug_lines_holder[0] or []
++        if not hasattr(args, "replay_prev_microbatch_debug_lines"):
++            args.replay_prev_microbatch_debug_lines = []
++        args.replay_prev_microbatch_debug_lines.extend(debug_lines)
+ 
+     # One-shot diagnostic: confirm packed/THD path is actually engaged.
+     if not getattr(get_batch, "_packed_diag_printed", False):
+@@ -143,17 +299,10 @@
+         except Exception:
+             _rank = 0
+         if _rank == 0:
+-            def _shape(x):
+-                return tuple(x.shape) if torch.is_tensor(x) else None
+             print(
+-                "[get_batch diag] cu_seqlens={} cu_seqlens_shape={} "
+-                "max_seqlen={} max_seqlen_shape={} "
+-                "packed_seq_params_is_not_none={}".format(
+-                    cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens,
+-                    _shape(cu_seqlens),
+-                    max_seqlen.tolist() if torch.is_tensor(max_seqlen) else max_seqlen,
+-                    _shape(max_seqlen),
++                "[get_batch diag] packed_seq_params_is_not_none={} batch_keys={}".format(
+                     packed_seq_params is not None,
++                    list(batch.keys()),
+                 ),
+                 flush=True,
+             )
+@@ -414,7 +563,7 @@
+         ModelType.encoder_or_decoder,
+         forward_step,
+         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
++        extra_args_provider=add_gpt_debug_args,
+         store=store,
+         get_embedding_ranks=get_embedding_ranks,
+     )
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -2153,6 +2153,10 @@
+             total_loss_dict[skipped_iters_key] = 0
+             total_loss_dict[nan_iters_key] = 0
+         print_rank_last(log_string)
++        if getattr(args, "replay_prev_microbatch_debug_lines", None):
++            for debug_line in args.replay_prev_microbatch_debug_lines:
++                print_rank_last(debug_line)
++            args.replay_prev_microbatch_debug_lines = []
+         reported_memory_in_this_iteration = False
+         if report_memory_flag:
+             # Report memory after optimizer state has been initialized.
