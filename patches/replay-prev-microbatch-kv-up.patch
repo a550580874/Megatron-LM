@@ -12,6 +12,22 @@
  
  stimer = StragglerDetector()
  
+-
+-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+-    """Generate a batch."""
+-    args = get_args()
+-    config = core_transformer_config_from_args(args)
+-    # TODO: this is pretty hacky, find a better way
+-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+-        return None, None, None, None, None, None
+-
+-    
+-    # get batches based onthe TP rank you are on
+-    batch = get_batch_on_this_tp_rank(
+-        data_iterator,
+-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
+-
 +# This state lives in the GPT entrypoint because we do not want to alter the
 +# scheduler: the deeper train loop should still execute the target micro-step,
 +# but that micro-step should see the previous batch instead of consuming a new
@@ -22,24 +38,11 @@
 +    "last_batch": None,
 +    "logged_targets": set(),
 +}
- 
--def get_batch(data_iterator, vp_stage: Optional[int] = None):
--    """Generate a batch."""
--    args = get_args()
--    config = core_transformer_config_from_args(args)
--    # TODO: this is pretty hacky, find a better way
--    if not is_first_or_last_pipeline_stage(vp_stage) and (
--    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
--        return None, None, None, None, None, None
++
 +_DEBUG_NORM_ITERATION = 4516
 +_DEBUG_NORM_RANK = 34
- 
--    
--    # get batches based onthe TP rank you are on
--    batch = get_batch_on_this_tp_rank(
--        data_iterator,
--        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
- 
++
++
 +def _clone_batch_for_replay(batch):
 +    """Clone a batch dict so it can be replayed without aliasing tensors."""
 +    cloned_batch = {}
@@ -171,7 +174,7 @@
          cp_size = args.context_parallel_size
          if cp_size > 1:
              seg_lens = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1])
-@@ -127,15 +212,119 @@
+@@ -127,14 +212,118 @@
                  )
  
      if cu_seqlens is None and local_cp_size is None:
@@ -189,7 +192,7 @@
 +        )
 +    else:
          batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
- 
++
 +    return batch, packed_seq_params
 +
 +
@@ -292,17 +295,16 @@
 +        if not hasattr(args, "replay_prev_microbatch_debug_lines"):
 +            args.replay_prev_microbatch_debug_lines = []
 +        args.replay_prev_microbatch_debug_lines.extend(debug_lines)
-+
+ 
      # One-shot diagnostic: confirm packed/THD path is actually engaged.
      if not getattr(get_batch, "_packed_diag_printed", False):
-         try:
 @@ -143,17 +332,10 @@
          except Exception:
              _rank = 0
          if _rank == 0:
 -            def _shape(x):
 -                return tuple(x.shape) if torch.is_tensor(x) else None
--            print(
+             print(
 -                "[get_batch diag] cu_seqlens={} cu_seqlens_shape={} "
 -                "max_seqlen={} max_seqlen_shape={} "
 -                "packed_seq_params_is_not_none={}".format(
@@ -310,7 +312,6 @@
 -                    _shape(cu_seqlens),
 -                    max_seqlen.tolist() if torch.is_tensor(max_seqlen) else max_seqlen,
 -                    _shape(max_seqlen),
-+            print(
 +                "[get_batch diag] packed_seq_params_is_not_none={} batch_keys={}".format(
                      packed_seq_params is not None,
 +                    list(batch.keys()),
@@ -328,10 +329,11 @@
      )
 --- a/megatron/training/training.py
 +++ b/megatron/training/training.py
-@@ -200,6 +200,105 @@
+@@ -199,6 +199,105 @@
+ from . import ft_integration
  
  stimer = StragglerDetector()
- 
++
 +# One-off replay debug settings for the investigation at iteration 4516.
 +_REPLAY_DEBUG_ITERATION = 4516
 +_REPLAY_DEBUG_RANK = 34
@@ -353,7 +355,6 @@
 +        or torch.distributed.get_rank() != _REPLAY_DEBUG_RANK
 +    ):
 +        return []
-+
 +
 +    handles = []
 +    for model_chunk in model:
@@ -431,9 +432,8 @@
 +    ]
 +    torch.distributed.broadcast_object_list(debug_lines_holder, src=_REPLAY_DEBUG_RANK)
 +    args.replay_prev_microbatch_debug_lines = debug_lines_holder[0] or []
-+
- from megatron.core.msc_utils import MultiStorageClientFeature, open_file
  
+ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
  
 @@ -1668,6 +1767,7 @@
          # Forward pass.
