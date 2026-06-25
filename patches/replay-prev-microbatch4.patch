@@ -1,3 +1,20 @@
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index b9ad03e..a235162 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -2153,6 +2153,10 @@ def training_log(
+             total_loss_dict[skipped_iters_key] = 0
+             total_loss_dict[nan_iters_key] = 0
+         print_rank_last(log_string)
++        if getattr(args, "replay_prev_microbatch_debug_lines", None):
++            for debug_line in args.replay_prev_microbatch_debug_lines:
++                print_rank_last(debug_line)
++            args.replay_prev_microbatch_debug_lines = []
+         reported_memory_in_this_iteration = False
+         if report_memory_flag:
+             # Report memory after optimizer state has been initialized.
+diff --git a/pretrain_gpt.py b/pretrain_gpt.py
+index 846caa3..22f1da8 100644
 --- a/pretrain_gpt.py
 +++ b/pretrain_gpt.py
 @@ -6,6 +6,7 @@
@@ -8,26 +25,10 @@
  import json
  
  # Suppress warnings on all ranks but rank 0.
-@@ -62,22 +63,113 @@
+@@ -62,22 +63,113 @@ except ImportError:
  
  stimer = StragglerDetector()
  
--
--def get_batch(data_iterator, vp_stage: Optional[int] = None):
--    """Generate a batch."""
--    args = get_args()
--    config = core_transformer_config_from_args(args)
--    # TODO: this is pretty hacky, find a better way
--    if not is_first_or_last_pipeline_stage(vp_stage) and (
--    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
--        return None, None, None, None, None, None
--
--    
--    # get batches based onthe TP rank you are on
--    batch = get_batch_on_this_tp_rank(
--        data_iterator,
--        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
--
 +# This state lives in the GPT entrypoint because we do not want to alter the
 +# scheduler: the deeper train loop should still execute the target micro-step,
 +# but that micro-step should see the previous batch instead of consuming a new
@@ -52,8 +53,21 @@
 +        else:
 +            cloned_batch[key] = copy.deepcopy(value)
 +    return cloned_batch
-+
-+
+ 
+-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+-    """Generate a batch."""
+-    args = get_args()
+-    config = core_transformer_config_from_args(args)
+-    # TODO: this is pretty hacky, find a better way
+-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+-        return None, None, None, None, None, None
+ 
+-    
+-    # get batches based onthe TP rank you are on
+-    batch = get_batch_on_this_tp_rank(
+-        data_iterator,
+-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
 +def _parse_iteration_microbatch_pairs(raw_pairs):
 +    """Parse 1-based iteration:microbatch CLI selectors."""
 +    parsed_pairs = set()
@@ -80,7 +94,7 @@
 +            getattr(args, "replay_prev_microbatch", [])
 +        )
 +    return args.replay_prev_microbatch_targets
-+
+ 
 +
 +def _batch_l2_norm(batch):
 +    total = 0.0
@@ -138,7 +152,7 @@
      cu_seqlens = batch.pop('cu_seqlens', None)
      cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
      max_seqlen = batch.pop('max_seqlen', None)
-@@ -85,17 +177,7 @@
+@@ -85,17 +177,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
      if local_cp_size is not None:
          local_cp_size = int(local_cp_size.item())
  
@@ -156,7 +170,7 @@
          assert args.micro_batch_size == 1, (
              "Packed/THD pretraining path (reset_attention_mask / "
              "reset_position_ids) requires --micro-batch-size 1 "
-@@ -104,10 +186,6 @@
+@@ -104,10 +186,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
          )
          cu_seqlens_padded = cu_seqlens
  
@@ -167,7 +181,7 @@
          cp_size = args.context_parallel_size
          if cp_size > 1:
              seg_lens = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1])
-@@ -127,14 +205,92 @@
+@@ -127,15 +205,93 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                  )
  
      if cu_seqlens is None and local_cp_size is None:
@@ -185,7 +199,7 @@
 +        )
 +    else:
          batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-+
+ 
 +    return batch, packed_seq_params
 +
 +
@@ -262,10 +276,11 @@
 +        if not hasattr(args, "replay_prev_microbatch_debug_lines"):
 +            args.replay_prev_microbatch_debug_lines = []
 +        args.replay_prev_microbatch_debug_lines.extend(debug_lines)
- 
++
      # One-shot diagnostic: confirm packed/THD path is actually engaged.
      if not getattr(get_batch, "_packed_diag_printed", False):
-@@ -143,17 +299,10 @@
+         try:
+@@ -143,17 +299,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
          except Exception:
              _rank = 0
          if _rank == 0:
@@ -285,7 +300,7 @@
                  ),
                  flush=True,
              )
-@@ -414,7 +563,7 @@
+@@ -414,7 +563,7 @@ if __name__ == "__main__":
          ModelType.encoder_or_decoder,
          forward_step,
          args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
@@ -294,16 +309,3 @@
          store=store,
          get_embedding_ranks=get_embedding_ranks,
      )
---- a/megatron/training/training.py
-+++ b/megatron/training/training.py
-@@ -2153,6 +2153,10 @@
-             total_loss_dict[skipped_iters_key] = 0
-             total_loss_dict[nan_iters_key] = 0
-         print_rank_last(log_string)
-+        if getattr(args, "replay_prev_microbatch_debug_lines", None):
-+            for debug_line in args.replay_prev_microbatch_debug_lines:
-+                print_rank_last(debug_line)
-+            args.replay_prev_microbatch_debug_lines = []
-         reported_memory_in_this_iteration = False
-         if report_memory_flag:
-             # Report memory after optimizer state has been initialized.
